@@ -25,6 +25,7 @@
 """
 import os
 import json
+import re
 import time
 
 import yaml
@@ -58,6 +59,10 @@ def _load_weread_data(lic_path: str = DEFAULT_LIC_PATH):
             data = json.loads(data)
         except Exception:
             data = {}
+    data = dict(data)
+    accounts = data.get("accounts")
+    if isinstance(accounts, list) and accounts:
+        data.update({key: accounts[0].get(key, "") for key in ("cookie", "vid", "name", "ticket")})
     return doc, data
 
 
@@ -74,6 +79,17 @@ def _save_cookie(cookie: str, name: str = "", lic_path: str = DEFAULT_LIC_PATH):
         data["vid"] = vid
     if name:
         data["name"] = name
+    accounts = data.get("accounts")
+    if isinstance(accounts, list) and accounts:
+        entry = next((account for account in accounts if str(account.get("vid", "")) == vid), None)
+        if entry is None:
+            entry = {"vid": vid, "name": name}
+            accounts.append(entry)
+        entry["cookie"] = cookie
+        if name:
+            entry["name"] = name
+        for key in ("cookie", "vid", "name", "ticket"):
+            data.pop(key, None)
     data["cookie_refresh_last_ts"] = time.time()
     doc["weread_data"] = data
     _write_lic(lic_path, doc)
@@ -104,54 +120,126 @@ def _dedupe_cookie(cookie: str) -> str:
     return "; ".join(kept.values())
 
 
-def _verify_cookie(cookie: str) -> bool:
-    """实打实请求一次 weread MP 接口，确认 Cookie 真能拉到数据。
+_VERIFY_BOOK_FALLBACK = "MP_WXS_3528995129"
 
-    仅检查 'wr_vid=' 不够：过期 Cookie 同样带 wr_vid，服务端会以 -2012/-2041 等拒绝。
-    故刷新后必须用真实接口验证，避免把过期 Cookie 误判为有效（假阳性）。
-    判定标准：响应 JSON 含非零 errCode（如 -2012 登录超时、-2041 等）即视为无效。
-    无 requests 时退化为 True（不阻断），但宿主机场景应装有 requests。
+
+def _verify_probe_book_ids(lic_path: str) -> list[str]:
+    """探针用 bookId：优先取 wx.lic 里配置的 cookie_refresh_url 中的 MP_WXS_*，
+
+    再补一个内置样例兜底（配置的公众号若停更无 reviewId，还有第二个候选可验）。
+    """
+    _, data = _load_weread_data(lic_path)
+    m = re.search(r"MP_WXS_\d+", str(data.get("cookie_refresh_url") or ""))
+    ids = [m.group(0)] if m else []
+    if _VERIFY_BOOK_FALLBACK not in ids:
+        ids.append(_VERIFY_BOOK_FALLBACK)
+    return ids
+
+
+def _verify_cookie(cookie: str, lic_path: str = DEFAULT_LIC_PATH) -> bool:
+    """实打实走一遍生产抓取路径，确认 Cookie 真能拉到正文。
+
+    两段验证：先用 /api/mp/cover 取该号最新一篇的 reviewId（验证基础登录态），
+    再请求 /web/mp/content 拉正文（验证内容接口权限）。半失效 Cookie 会让 cover
+    照常返回而 /web/mp/* 接口返回 -2012 或空体——只验 cover 会把死 Cookie 误判成活。
+    缺少 requests 或验证网络失败时返回 False，不保存未经验证的 Cookie。
     """
     try:
         import requests
     except ImportError:
-        return True
+        return False
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": "https://weread.qq.com/",
+    }
+    proxy_url = os.environ.get("WEREAD_BROWSER_PROXY", "").strip()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     try:
-        r = requests.get(
-            "https://weread.qq.com/web/mp/articles",
-            params={"bookId": "MP_WXS_3528995129", "offset": 0},
-            headers={
-                "Cookie": cookie,
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-                "Referer": "https://weread.qq.com/",
-            },
-            timeout=30,
-        )
-        try:
-            j = r.json()
-        except Exception:
-            return False
-        if isinstance(j, dict):
+        review_id = ""
+        for book_id in _verify_probe_book_ids(lic_path):
+            r = None
+            # SR 代理对 CN 域名偶发 503（Tunnel connection failed），重试吸收抖动
+            for _attempt in range(3):
+                try:
+                    r = requests.get(
+                        "https://weread.qq.com/api/mp/cover",
+                        params={"bookId": book_id},
+                        headers=headers,
+                        proxies=proxies,
+                        timeout=30,
+                    )
+                    break
+                except Exception:
+                    r = None
+                    time.sleep(1.5)
+            if r is None:
+                continue
+            try:
+                j = r.json()
+            except Exception:
+                return False
+            if not isinstance(j, dict):
+                return False
             code = j.get("errCode", j.get("errcode", 0))
             if code:  # 任何非零 errCode 均表示无效（含 -2012/-2041 等）
                 return False
-            # 有实际数据字段才视为有效
-            if "reviews" in j or "articles" in j or "synckey" in j or j.get("bookId"):
-                return True
+            review_id = str(j.get("reviewId") or "").strip()
+            if review_id:
+                break
+        if not review_id:
+            # 没有正文可验证，不能据公开封面认定登录态有效。
+            return False
+        c = None
+        for _attempt in range(3):
+            try:
+                c = requests.get(
+                    "https://weread.qq.com/web/mp/content",
+                    params={"reviewId": review_id},
+                    headers={**headers, "Accept": "text/html,application/xhtml+xml,*/*"},
+                    proxies=proxies,
+                    timeout=30,
+                )
+                break
+            except Exception:
+                c = None
+                time.sleep(1.5)
+        if c is None:
+            return False
+        if c.status_code != 200 or not c.text.strip():
+            return False
+        try:
+            c.json()
+        except ValueError:
+            # 非 JSON = 真文章 HTML。新版 WeRead 页面形态多样：常规文 js_content、
+            # 短文 text_page_info、图集 picture_page_info_list、客户端渲染壳
+            # js_content_container——任一标记即视为有效正文
+            # （旧版只认 id="js_content"，会把新版页面误判为无效，实测）。
+            text = c.text
+            return any(
+                m in text
+                for m in (
+                    "js_content",
+                    "rich_media_content",
+                    "text_page_info",
+                    "picture_page_info_list",
+                )
+            )
+        # 正文接口的 JSON 响应是错误/状态消息，不是 HTML 正文。
         return False
     except Exception:
         return False
 
 
 def _extract_cookie_from_page(page, context, url: str) -> str:
-    """优先从 /web/mp/articles 请求头取 Cookie，回退 context.cookies 拼接。"""
+    """优先从公众号接口请求头取 Cookie，回退 context.cookies 拼接。"""
     captured = {}
 
     def _on_request(request):
-        if "web/mp/articles" in request.url:
-            captured["cookie"] = request.headers.get("cookie", "")
+        if any(path in request.url for path in ("/api/mp/cover", "/web/mp/content", "/web/mp/articles")):
+            captured["cookie"] = request.all_headers().get("cookie", "")
 
     page.on("request", _on_request)
     try:
@@ -168,6 +256,73 @@ def _extract_cookie_from_page(page, context, url: str) -> str:
         return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
     except Exception:
         return ""
+
+
+RENEWAL_URL = "https://weread.qq.com/web/login/renewal"
+
+
+def _renew_session(cookie: str, timeout: int = 20) -> str:
+    """用 wr_rt 调 /web/login/renewal 刷新服务端会话，返回刷新后的 Cookie 串；失败返回 ""。
+
+    微信读书 web 会话的 wr_skey 短时有效（续期响应 Max-Age≈90 分钟），wr_rt
+    （refresh token）有效期约一年。浏览器登录态靠页面周期性调 renewal 维持——
+    本函数把同一机制搬到宿主：无需浏览器、无需扫码即可续期，是长期稳定的主路径。
+    """
+    import re as _re
+
+    try:
+        import requests
+    except ImportError:
+        return ""
+    m_rt = _re.search(r"wr_rt=([^;]+)", cookie)
+    m_vid = _re.search(r"wr_vid=([^;]+)", cookie)
+    if not m_rt or not m_vid:
+        return ""
+    proxy_url = os.environ.get("WEREAD_BROWSER_PROXY", "").strip()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Origin": "https://weread.qq.com",
+        "Referer": "https://weread.qq.com/",
+    })
+    # 登录 Cookie 必须注入 session 的 cookie jar（domain=weread.qq.com），
+    # 否则服务端按游客处理（-2013）。
+    s.cookies.set("wr_rt", m_rt.group(1), domain="weread.qq.com", path="/")
+    s.cookies.set("wr_vid", m_vid.group(1), domain="weread.qq.com", path="/")
+    r = None
+    for _attempt in range(3):
+        try:
+            r = s.post(RENEWAL_URL, data={"rq": "%2Fweb%2Fbook%2Fread"},
+                       proxies=proxies, timeout=timeout)
+            break
+        except Exception:
+            r = None
+            time.sleep(1.5)
+    if r is None:
+        return ""
+    try:
+        j = r.json()
+    except Exception:
+        return ""
+    if not isinstance(j, dict) or j.get("succ") != 1:
+        return ""
+    # 续期可能下发新 wr_skey（也可能同值仅刷新 TTL）：以响应 jar 为准合并更新。
+    # 注意：服务端会带回 wr_pf=undefined / NaN 这类 JS 哨兵值，属非法 Cookie，
+    # 写入后会毒化整条 Cookie 串（正文验证 3/3 失败，实测），必须过滤。
+    _INVALID = {"undefined", "NaN", "null", ""}
+    pairs = {}
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part and "=" in part:
+            k, v = part.split("=", 1)
+            pairs[k.strip()] = v.strip()
+    for c in s.cookies:
+        if c.value and c.name and c.value not in _INVALID:
+            pairs[c.name] = c.value
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 
 def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
@@ -203,6 +358,22 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
             if verbose:
                 print("[refresh] Cookie 在冷却期内但已失效，强制刷新")
 
+    # 0) 续期优先（长期稳定主路径）：wr_rt 有效即可刷新会话，无需浏览器/扫码。
+    #    放在浏览器链之前：renewal 成功且正文验证通过即结束，避免无谓的 profile 启动。
+    cur_cookie = (data.get("cookie") or "").strip()
+    if cur_cookie:
+        renewed = _renew_session(cur_cookie)
+        if renewed:
+            if _verify_cookie(renewed, DEFAULT_LIC_PATH):
+                _save_cookie(renewed, lic_path=DEFAULT_LIC_PATH)
+                if verbose:
+                    print("[refresh] renewal 续期成功，会话已刷新并验证通过")
+                return True
+            if verbose:
+                print("[refresh] renewal 已刷新会话，但正文验证未通过，继续完整刷新链")
+        elif verbose:
+            print("[refresh] renewal 不可用（wr_rt 缺失或服务端拒绝），继续完整刷新链")
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -215,10 +386,15 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
 
     def _launch(p, headless: bool, force_bundled: bool = False):
         args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        if force_bundled or not browser_path:
-            return p.chromium.launch_persistent_context(profile_dir, headless=headless, args=args)
+        proxy_url = os.environ.get("WEREAD_BROWSER_PROXY", "").strip()
+        proxy = {"server": proxy_url} if proxy_url else None
+        if force_bundled:
+            return p.chromium.launch_persistent_context(profile_dir, headless=headless, args=args, proxy=proxy)
+        if not browser_path:
+            return p.chromium.launch_persistent_context(
+                profile_dir, headless=headless, channel="chrome", args=args, proxy=proxy)
         return p.chromium.launch_persistent_context(
-            profile_dir, headless=headless, executable_path=browser_path, args=args,
+            profile_dir, headless=headless, executable_path=browser_path, args=args, proxy=proxy,
         )
 
     def _try(headless: bool, wait_login: bool = False, timeout_s: int = 300,
@@ -299,10 +475,9 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
             finally:
                 context.close()
 
-    # 1) 常规无头刷新：登录态持久化，通常直接拿到有效 Cookie
-    #    注入 wx.lic 已有 Cookie 作为种子（跨平台 profile 不互通时的可信回退）
+    # 1) 先使用持久 profile，避免过期种子覆盖仍有效的登录态。
     seed_cookie = (data.get("cookie") or "").strip()
-    cookie = _try(headless=True, force_bundled=force_bundled, seed_cookie=seed_cookie)
+    cookie = _try(headless=True, force_bundled=force_bundled)
     # 必须实打实验证 Cookie 真能拉到数据，避免把过期 Cookie 误判为有效（假阳性）
     if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
         vid = extract_vid(cookie)
@@ -311,10 +486,22 @@ def refresh_weread_cookie(verbose: bool = True, headless_only: bool = False,
             print(f"[refresh] Cookie 已自动更新 (vid={vid})")
         return True
 
+    # profile 无效时再尝试 wx.lic 种子，支持不同平台无法解密 profile 的场景。
+    if seed_cookie:
+        if verbose:
+            print("[refresh] 持久 profile 刷新失败，尝试 wx.lic 种子 Cookie")
+        cookie = _try(headless=True, force_bundled=force_bundled, seed_cookie=seed_cookie)
+        if cookie and "wr_vid=" in cookie and _verify_cookie(cookie):
+            vid = extract_vid(cookie)
+            _save_cookie(cookie, name=data.get("name", ""))
+            if verbose:
+                print(f"[refresh] Cookie 已自动更新（种子回退, vid={vid}）")
+            return True
+
     # 2) 未拿到有效 Cookie（或拿到但验证失败＝过期）
     if headless_only:
         if verbose:
-            print("[refresh] Cookie 无效/已过期（接口返回 -2012）。无头模式不弹窗，"
+            print("[refresh] Cookie 未通过正文访问验证。无头模式不弹窗，"
                   "请在本机运行 'python scripts/refresh_weread_cookie.py' 扫码登录后刷新")
         return False
 

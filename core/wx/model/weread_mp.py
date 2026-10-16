@@ -1,6 +1,8 @@
 """Collect WeChat Official Account articles through WeRead Web."""
 
 import time
+import html as html_lib
+import re
 from urllib.parse import quote
 
 from bs4 import BeautifulSoup
@@ -26,11 +28,9 @@ def build_mp_url(original_id: str) -> str:
     original_id = str(original_id or "").strip()
     if not original_id:
         return ""
-    # 微信文章短链 token 的字符集是 URL-safe 的（A-Za-z0-9_-），
-    # 微信读书返回的 ID 里把 '_' 写成了 '~'，必须换回来，否则微信返回"参数错误"。（如 ySsAk3lUFT0Wh~9IZCtr-g）
-    # （实测 2026-09-23：149 篇含 '~' 的链接全部参数错误，替换后 100% 可打开。）
-    original_id = original_id.replace("~", "_")
-    article_token = quote(original_id, safe="")
+    # WeRead uses '~' in its article token, while the public WeChat short-link
+    # endpoint expects the same token position to use '_'.
+    article_token = quote(original_id.replace("~", "_"), safe="")
     return f"https://mp.weixin.qq.com/s/{article_token}"
 
 
@@ -38,9 +38,9 @@ def build_mp_link_from_review_id(review_id: str, book_id: str = "") -> str:
     """从 WeRead 的 reviewId 推导公众号原文链接。
 
     reviewId 形如 ``MP_WXS_<bookId>_<articleToken>``，末尾段即为
-    mp.weixin.qq.com 原文短链的 token。微信读书把 token 里的 ``_`` 写成了
-    ``~``，须还原为 ``_``，否则微信返回"参数错误"。新版接口 ``/api/mp/cover``
-    不返回 originalId，只能由此推导。
+    mp.weixin.qq.com 原文短链的 token。WeRead token 中的 ``~`` 需要
+    映射为微信短链使用的 ``_``。新版接口 ``/api/mp/cover`` 不返回
+    originalId，只能由 reviewId 推导。
     """
     review_id = str(review_id or "").strip()
     if not review_id:
@@ -51,9 +51,7 @@ def build_mp_link_from_review_id(review_id: str, book_id: str = "") -> str:
         token = review_id[len(prefix):]
     elif "_" in token:
         token = token.split("_")[-1]
-    # 前缀拆分依赖原始的 '_'，'~' → '_' 的还原必须放在拆分之后
-    token = token.replace("~", "_")
-    return f"https://mp.weixin.qq.com/s/{quote(token, safe='')}"
+    return f"https://mp.weixin.qq.com/s/{quote(token.replace('~', '_'), safe='')}"
 
 
 def _raise_response_error(payload: dict):
@@ -109,11 +107,91 @@ def parse_mp_articles(payload: dict):
 def extract_mp_content(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     content = soup.select_one("#js_content") or soup.select_one(".rich_media_content")
-    if content is None:
-        raise WereadMPAPIError("invalid_content", "article body was not found")
-    for element in content.select("script, style"):
-        element.decompose()
-    return content.decode_contents().strip()
+    if content is not None:
+        for element in content.select("script, style"):
+            element.decompose()
+        return content.decode_contents().strip()
+
+    # WeRead also serves legitimate short-text and picture-page articles as a
+    # client-rendered WeChat shell without #js_content. Preserve those payloads
+    # instead of treating a successful response as an empty article.
+    title_node = soup.select_one('meta[property="og:title"]')
+    description_node = (
+        soup.select_one('meta[property="twitter:description"]')
+        or soup.select_one('meta[property="og:description"]')
+        or soup.select_one('meta[name="description"]')
+    )
+    title = (title_node.get("content") if title_node else "") or ""
+    description = (description_node.get("content") if description_node else "") or ""
+
+    def decode_js_string(value: str) -> str:
+        value = re.sub(
+            r"\\x([0-9a-fA-F]{2})",
+            lambda match: chr(int(match.group(1), 16)),
+            value,
+        )
+        value = value.replace(r"\n", "\n").replace(r"\r", "\r")
+        value = value.replace(r"\'", "'").replace(r'\"', '"').replace(r"\\", "\\")
+        return html_lib.unescape(value).strip()
+
+    text_match = re.search(
+        r"text_page_info:\s*\{\s*content:\s*'((?:\\.|[^'])*)'",
+        html or "",
+        flags=re.DOTALL,
+    )
+    if text_match:
+        text = decode_js_string(text_match.group(1))
+        if text:
+            return f"<p>{html_lib.escape(text).replace(chr(10), '<br/>')}</p>"
+
+    picture_start = re.search(r"picture_page_info_list:\s*\[", html or "")
+    picture_block = ""
+    if picture_start:
+        start = picture_start.end() - 1
+        depth = 0
+        quote = ""
+        escaped = False
+        for index in range(start, len(html)):
+            character = html[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "[":
+                depth += 1
+            elif character == "]":
+                depth -= 1
+                if depth == 0:
+                    picture_block = html[start + 1:index]
+                    break
+
+    if picture_block:
+        image_urls = [
+            decode_js_string(value)
+            for value in re.findall(
+                r"cdn_url:\s*'((?:\\.|[^'])*)'",
+                picture_block,
+            )
+        ]
+        image_urls = list(dict.fromkeys(url for url in image_urls if url))
+        parts = []
+        if title.strip():
+            parts.append(f"<h1>{html_lib.escape(decode_js_string(title))}</h1>")
+        if description.strip():
+            parts.append(
+                f"<p>{html_lib.escape(decode_js_string(description)).replace(chr(10), '<br/>')}</p>"
+            )
+        parts.extend(f'<p><img src="{html_lib.escape(url, quote=True)}" /></p>' for url in image_urls)
+        if parts:
+            return "".join(parts)
+
+    raise WereadMPAPIError("invalid_content", "article body was not found")
 
 
 class MpsWereadMP(MpsWeread):
@@ -237,21 +315,50 @@ class MpsWereadMP(MpsWeread):
             session.close()
 
     def _get_mp_content(self, review_id: str):
-        try:
-            response = self._weread_http_get(
-                f"{WEREAD_WEB_BASE}/web/mp/content",
-                params={"reviewId": review_id},
-            )
-        except Exception as exc:
-            if isinstance(exc, WereadMPAPIError):
-                raise
-            raise WereadMPAPIError("network_error", str(exc)) from exc
-        if response.status_code != 200:
-            raise WereadMPAPIError(
-                response.status_code,
-                f"article content returned HTTP {response.status_code}",
-            )
-        return extract_mp_content(response.text)
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = self._weread_http_get(
+                    f"{WEREAD_WEB_BASE}/web/mp/content",
+                    params={"reviewId": review_id},
+                    timeout=(10, 30),
+                )
+            except WereadMPAPIError as exc:
+                if not exc.retriable:
+                    raise
+                last_error = exc
+            except requests.RequestException as exc:
+                last_error = WereadMPAPIError("network_error", str(exc))
+            else:
+                if response.status_code != 200:
+                    last_error = WereadMPAPIError(
+                        response.status_code,
+                        f"article content returned HTTP {response.status_code}",
+                    )
+                elif not response.text.strip():
+                    last_error = WereadMPAPIError(
+                        "empty_response",
+                        "article content response was empty",
+                    )
+                elif "账号已迁移" in response.text:
+                    raise WereadMPAPIError(
+                        "migrated",
+                        "公众号账号已迁移",
+                        retriable=False,
+                    )
+                else:
+                    try:
+                        return extract_mp_content(response.text)
+                    except WereadMPAPIError as exc:
+                        last_error = exc
+
+            if attempt < 2:
+                time.sleep(1 + attempt)
+
+        raise last_error or WereadMPAPIError(
+            "invalid_content",
+            "article body was not found",
+        )
 
     def _collect_latest_via_cover(
         self,

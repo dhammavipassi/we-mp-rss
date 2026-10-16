@@ -78,6 +78,39 @@ class WereadMpParsingTest(unittest.TestCase):
 
         self.assertEqual(extract_mp_content(html), '<p>Hello</p>')
 
+    def test_extract_mp_content_supports_text_page(self):
+        html = """
+        <meta property="og:title" content="短内容" />
+        <script>
+          text_page_info: {
+            content: '第一行\\x0a第二行',
+          },
+        </script>
+        """
+
+        self.assertEqual(
+            extract_mp_content(html),
+            "<p>第一行<br/>第二行</p>",
+        )
+
+    def test_extract_mp_content_supports_picture_page(self):
+        html = """
+        <meta property="og:title" content="图片页" />
+        <meta property="twitter:description" content="图片摘要" />
+        <script>
+          picture_page_info_list: [
+            { cdn_url: 'https://example.test/image.jpg' },
+          ],
+          text_page_info: {
+          },
+        </script>
+        """
+
+        content = extract_mp_content(html)
+        self.assertIn("图片页", content)
+        self.assertIn("图片摘要", content)
+        self.assertIn("https://example.test/image.jpg", content)
+
     def test_build_mp_url_rejects_missing_original_id(self):
         self.assertEqual(build_mp_url(""), "")
 

@@ -100,6 +100,39 @@ def _fetch_with_api(url: str) -> Tuple[str, Any]:
     return str(article_body), {}
 
 
+def _weread_review_id(article: Any) -> str:
+    """Rebuild the WeRead reviewId stored in a MP_WXS article row."""
+    mp_id = str(getattr(article, "mp_id", "") or "").strip()
+    article_id = str(getattr(article, "id", "") or "").strip()
+    if not mp_id.startswith("MP_WXS_") or not article_id:
+        return ""
+
+    mp_digits = mp_id[len("MP_WXS_"):]
+    stored_prefix = f"{mp_digits}-"
+    origin_id = article_id[len(stored_prefix):] if article_id.startswith(stored_prefix) else article_id
+    # Article.id keeps the book id in the original token (e.g.
+    # ``3540975510_xxx``), while WeRead's reviewId contains that book id only
+    # once: ``MP_WXS_3540975510_xxx``.
+    repeated_prefix = f"{mp_digits}_"
+    if origin_id.startswith(repeated_prefix):
+        origin_id = origin_id[len(repeated_prefix):]
+    return f"{mp_id}_{origin_id}"
+
+
+def _fetch_with_weread_mp(article: Any) -> Tuple[str, str, str]:
+    """Fetch WeRead-backed public-account content through the WeRead API."""
+    review_id = _weread_review_id(article)
+    if not review_id:
+        return "", "weread_mp", ""
+
+    from core.wx.model.weread_mp import MpsWereadMP
+
+    fetcher = MpsWereadMP()
+    fetcher._load_weread_auth()
+    content = fetcher._get_mp_content(review_id)
+    return content, "weread_mp", ""
+
+
 def _fetch_article_content_unbounded(
     url: str,
     preferred_mode: str | None = None,
@@ -193,14 +226,17 @@ def sync_article_content(
             return True, "cached"
         return False, "cached"
 
-    article_url = build_article_url(article)
-    if not article_url:
-        print_warning(f"article {getattr(article, 'id', '')} has no valid url")
-        mark_article_fetch_failed(session, article, "missing_url")
-        return False, "missing_url"
-
+    is_weread_mp = str(getattr(article, "mp_id", "") or "").startswith("MP_WXS_")
     try:
-        content, mode, article_type = fetch_article_content(article_url, preferred_mode)
+        if is_weread_mp:
+            content, mode, article_type = _fetch_with_weread_mp(article)
+        else:
+            article_url = build_article_url(article)
+            if not article_url:
+                print_warning(f"article {getattr(article, 'id', '')} has no valid url")
+                mark_article_fetch_failed(session, article, "missing_url")
+                return False, "missing_url"
+            content, mode, article_type = fetch_article_content(article_url, preferred_mode)
     except ProcessExecutionTimeout as exc:
         mark_article_fetch_failed(session, article, str(exc))
         return False, "timeout"
@@ -210,7 +246,7 @@ def sync_article_content(
     except Exception as exc:
         session.rollback()
         mark_article_fetch_failed(session, article, str(exc))
-        return False, "error"
+        return False, "weread_mp" if is_weread_mp else "error"
 
     if not content:
         mark_article_fetch_failed(session, article, f"empty response via {mode}")

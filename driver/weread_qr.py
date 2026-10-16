@@ -764,30 +764,23 @@ class WereadQRLogin:
             except Exception:
                 pass
 
-            # 2) weread 主站 mp 接口兜底（同样完整请求头）
+            # 2) 生产路径兜底（cover → /web/mp/content）：复用 core 的权威验证实现。
+            #    注意：旧 /web/mp/articles 列表接口已废弃（所有账号均返回 -2041
+            #    "request blocked"，是端点级响应而非 Cookie 失效判据），不得再用于验证。
             try:
-                r = requests.get(
-                    f"{WEREAD_BASE}/web/mp/articles",
-                    params={"bookId": "MP_WXS_3528995129", "offset": 0},
-                    headers=headers,
-                    timeout=20,
+                from core.weread_cookie_refresh import (
+                    _verify_cookie as _core_verify,
+                    DEFAULT_LIC_PATH,
                 )
-                if r.status_code == 200:
-                    j = r.json()
-                    code = j.get("errCode", j.get("errcode", 0))
-                    if not code and (
-                        "reviews" in j or "articles" in j or "synckey" in j or j.get("bookId")
-                    ):
-                        return True
+
+                if _core_verify(cookie_str, DEFAULT_LIC_PATH):
+                    return True
             except Exception:
                 pass
 
-            last_desc = ""
-            try:
-                last_desc = f"status={r.status_code} body={r.text[:200]!r}"
-            except Exception:
-                last_desc = "(请求异常，无法取回响应)"
-            print_warning(f"Weread QR: Cookie 验证失败 {last_desc}")
+            print_warning(
+                "Weread QR: Cookie 验证失败（书架接口与生产路径 cover/content 均未通过）"
+            )
             return False
         except Exception as e:
             print_warning(f"Weread QR: Cookie 验证异常: {e}")

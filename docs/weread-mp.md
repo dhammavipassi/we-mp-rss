@@ -41,3 +41,23 @@ GATHER.CONTENT=True
 - 拿不到历史文章列表：`/api/mp/cover` 只返回最新一篇，无法回补公众号历史文章（旧版列表接口已废弃）。
 - Cookie 过期时（返回 `-2012`/`-2041`），应从浏览器重新复制 Cookie；通过环境变量提供的凭据优先于管理页保存值，管理页会标记为部署配置托管。
 - 微信读书有访问频率限制，全文请求间隔建议保持 `WEREAD_CONTENT_INTERVAL >= 2`。
+
+## 登录态维护
+
+宿主机刷新代理使用独立持久 Chrome profile。未指定 browser_path 时使用本机 Chrome；容器只消费同一挂载目录中的 wx.lic，不读取日常 Chrome 登录态。
+
+刷新顺序为：验证现有 Cookie 的实际正文访问 → 尝试持久 profile → 尝试配置 Cookie 种子 → 需要人工扫码。cover 返回公共信息不证明正文授权；正文必须返回文章 HTML，错误 JSON 和网络失败不视为有效会话。浏览器和验证请求使用同一 WEREAD_BROWSER_PROXY。
+
+二维码登录入口为 http://127.0.0.1:9876/login。页面自动更新当前二维码；微信扫码并确认后，容器登录驱动写回 wx.lic，宿主验证正文访问。不要扫描先前保存的二维码截图。
+
+降低重复失效的原则：保持专用 profile、同一授权账号和一致网络路径；尊重正文请求间隔，不通过高频请求延长会话。保活验证只证明当次可用，不承诺服务端会话延长，也不修改 Cookie 有效期来伪造登录成功。
+
+刷新链顺序（2026-10-02 起）：**renewal 续期优先** → 持久 profile → 种子 Cookie → 扫码。
+renewal（`/web/login/renewal`，凭 wr_rt）无需浏览器即可刷新服务端会话，wr_rt 有效期约一年——
+会话失效时自动续期是长期免扫码的主路径，扫码仅在 wr_rt 失效时兜底。
+验证正文时必须兼容新版页面形态（js_content / rich_media_content / text_page_info /
+picture_page_info_list）；旧 /web/mp/articles 列表接口已废弃（-2041），不得用作判据。
+
+验证与状态以 host agent /refresh 响应、正文访问结果和实际回写为准。当前捕获与扫码续期的隔离回归见 core/test_weread_cookie_refresh.py 和 tests/test_host_weread_refresh_agent.py；源码修复不等于已完成新的人工扫码。
+
+参考：[Playwright 持久浏览器上下文](https://playwright.dev/python/docs/api/class-browsertype)、[Cookie 生命周期](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Cookies)。

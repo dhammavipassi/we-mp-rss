@@ -275,6 +275,34 @@ class ContentFetchQueueTest(unittest.TestCase):
         self.assertEqual(mode, "api")
         web_fetch.assert_not_called()
 
+    def test_weread_mp_refresh_uses_weread_review_id(self):
+        article = self.add_article(
+            "3540975510-3540975510_xe-EgpX-t5FcI9L~2SAhUg",
+            mp_id="MP_WXS_3540975510",
+        )
+
+        with patch("core.wx.model.weread_mp.MpsWereadMP") as collector_cls:
+            collector = collector_cls.return_value
+            collector._get_mp_content.return_value = (
+                "<div id='js_content'><p>WeRead body</p></div>"
+            )
+
+            with patch.object(article_content, "fetch_article_content") as generic_fetch:
+                updated, mode = article_content.sync_article_content(
+                    self.session,
+                    article,
+                    force=True,
+                )
+
+        self.assertTrue(updated)
+        self.assertEqual(mode, "weread_mp")
+        generic_fetch.assert_not_called()
+        collector._load_weread_auth.assert_called_once_with()
+        collector._get_mp_content.assert_called_once_with(
+            "MP_WXS_3540975510_xe-EgpX-t5FcI9L~2SAhUg"
+        )
+        self.assertEqual(article.has_content, 1)
+
     def test_failed_article_does_not_prevent_next_batch_item(self):
         self.add_article("first", publish_time=2)
         self.add_article("second", publish_time=1)

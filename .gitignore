@@ -28,3 +28,6 @@ test.yaml
 .travis
 test.py
 .codeartsdoer
+# 微信读书诊断缓存与二维码（含登录凭据/一次性码，不入库）
+static/weread_cookies.json
+static/weread_qrcode.png
