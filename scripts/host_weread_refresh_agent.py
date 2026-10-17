@@ -211,7 +211,7 @@ def _push_omnifocus_scan_needed():
              "登录二维码已弹到默认浏览器，微信扫码+手机确认后管道自动恢复。",
              "--project", "管道故障",
              "--flag", "--replace"],
-            timeout=90, capture_output=True)
+            timeout=600, capture_output=True)
         if result.returncode == 0:
             Path(ALERT_MARK).touch()
         else:
