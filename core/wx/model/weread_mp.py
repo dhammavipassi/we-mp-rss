@@ -207,6 +207,27 @@ class MpsWereadMP(MpsWeread):
         finally:
             session.close()
 
+    def _use_article_list(self) -> bool:
+        """是否走 ``/web/mp/articles`` 列表接口。
+
+        该接口已被微信读书废弃：docs/weread-mp.md 明确记录「实测恒返回
+        -2041，前端 JS 中也不再有文章列表接口」且「不得用作判据」。
+
+        默认关闭的理由（实测 2026-10-19）：
+        - 每源每轮都会先付一次注定失败的请求，再回落 cover；
+        - 失败被包装成「所有账号配额均已耗尽（-2012）」，把「接口废弃」
+          误报成「配额耗尽」，误导排查方向；
+        - 多账号 failover 会因此把每个账号都试一遍，进一步放大请求量。
+
+        仅在上游恢复该接口后，用 ``weread.use_article_list=true`` 显式打开。
+        """
+        from core.config import cfg
+
+        raw = cfg.get("weread.use_article_list", False)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
     def _get_catchup_page_limit(self, requested_pages: int) -> int:
         from core.config import cfg
 
@@ -582,25 +603,29 @@ class MpsWereadMP(MpsWeread):
 
         print_info(f"微信读书公众号采集模式: {Mps_title} ({book_id})")
         try:
-            try:
-                latest_publish_time = self._collect_via_article_list(
-                    book_id,
-                    Mps_id,
-                    Mps_title,
-                    gather_content,
-                    start_page,
-                    MaxPage,
-                    CallBack=CallBack,
-                    Item_Over_CallBack=Item_Over_CallBack,
-                )
-            except WereadMPAPIError as exc:
-                if self.response_valid:
-                    # 列表接口本身可用（已成功翻页），属于正文缺失或补抓不完整
-                    # 等真实错误，直接上抛，下次任务重试。
-                    raise
-                print_warning(
-                    f"[{Mps_title}] 文章列表接口不可用({exc})，回退到仅取最新一篇"
-                )
+            latest_publish_time = None
+            if self._use_article_list():
+                try:
+                    latest_publish_time = self._collect_via_article_list(
+                        book_id,
+                        Mps_id,
+                        Mps_title,
+                        gather_content,
+                        start_page,
+                        MaxPage,
+                        CallBack=CallBack,
+                        Item_Over_CallBack=Item_Over_CallBack,
+                    )
+                except WereadMPAPIError as exc:
+                    if self.response_valid:
+                        # 列表接口本身可用（已成功翻页），属于正文缺失或补抓不完整
+                        # 等真实错误，直接上抛，下次任务重试。
+                        raise
+                    print_warning(
+                        f"[{Mps_title}] 文章列表接口不可用({exc})，回退到仅取最新一篇"
+                    )
+                    latest_publish_time = None
+            if latest_publish_time is None:
                 latest_publish_time = self._collect_latest_via_cover(
                     book_id,
                     Mps_id,

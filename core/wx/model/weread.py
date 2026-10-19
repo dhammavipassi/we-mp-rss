@@ -52,6 +52,10 @@ class MpsWeread(WxGather):
     每本书映射为 Feed（订阅源），每条笔记/划线映射为 Article（文章）。
     """
 
+    # 进程级：书架接口被风控拒绝后的短路原因。空串表示尚未判定。
+    # 采集器按源实例化，实例级标记无法跨源生效，故用类属性。
+    _shelf_unavailable_reason: str = ""
+
     def __init__(self, is_add: bool = False):
         super().__init__(is_add=is_add)
         self._weread_cookies: str = ""
@@ -361,13 +365,22 @@ class MpsWeread(WxGather):
             return True, "非微信读书公众号，跳过书架检查"
         if not cfg.get("weread.auto_add_to_shelf", True):
             return True, "未启用自动添加书架（weread.auto_add_to_shelf=false）"
+        # 书架接口与正文/列表共用同一风控签名（-2012/-2041/499）。一旦本轮
+        # 确认不可用，就按进程短路：否则每个源都要先付一次注定失败的请求
+        # （25 个源 = 每轮 25 次），还被包装成「Cookie 可能已过期」误导排查。
+        # cover 增量不依赖书架状态，短路不影响采集结果。
+        if type(self)._shelf_unavailable_reason:
+            return False, type(self)._shelf_unavailable_reason
         if not self._weread_vid:
             self._weread_vid = self._extract_vid_from_cookie(self._weread_cookies)
 
         shelf = self._get_shelf_books()
         if shelf is None:
-            # 与「空书架」区分：请求失败/登录态失效
-            return False, "书架获取失败（Cookie 可能已过期），无法确认书架状态"
+            # 与「空书架」区分：请求失败/风控签名（-2012/-2041/499 与配额同码，
+            # 断言「Cookie 过期」会误导——正文 cover 往往仍然可用）。
+            reason = "书架接口被风控/限流拒绝（非 Cookie 过期），已按进程跳过书架检查"
+            type(self)._shelf_unavailable_reason = reason
+            return False, reason
         if any(b["book_id"] == book_id for b in shelf):
             return True, "已在书架"
         if not self._weread_vid:
