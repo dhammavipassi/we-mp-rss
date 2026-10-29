@@ -75,6 +75,11 @@ QR_MARK = os.path.join(os.path.dirname(LIC_PATH), ".qr_prompted_ts")
 # 事故级去重标记：存在期间不再向 OmniFocus 推「扫码登录」任务，
 # Cookie 恢复验证通过时清除——同一事故只推一条，恢复后再坏才推下一条
 ALERT_MARK = os.path.join(os.path.dirname(LIC_PATH), ".cookie_alert_active")
+# -2012 观察状态：登录过期与配额耗尽在微信读书 API 层同码（都返回
+# {"errCode":-2012,"errMsg":"登录超时"}）。Cookie 结构完整却取不到正文时，
+# 先按配额耗尽处理（重扫码无效），超过这个窗口仍失败才升级为扫码。
+STATE_2012 = os.path.join(os.path.dirname(LIC_PATH), ".weread_2012_state")
+ESCALATE_AFTER_S = float(os.environ.get("WEREAD_2012_ESCALATE_H", "20")) * 3600
 
 # 串行化刷新，避免并发（如 07:55 定时 + 手动执行同时触发）争抢同一 profile
 _refresh_lock = threading.Lock()
@@ -92,12 +97,47 @@ def do_refresh() -> dict:
     cookie = (data.get("cookie") or "").strip()
     if cookie and _verify_cookie(cookie):
         _clear_alert_mark()
+        _clear_2012_state()
         return {
             "ok": True,
             "refreshed": False,
             "needs_scan": False,
             "message": "Cookie 仍有效，无需刷新",
         }
+
+    # 1.5) -2012 歧义区：Cookie 结构完整却取不到正文。微信读书对「登录过期」
+    #      与「配额耗尽」返回同一个 {"errCode":-2012,"errMsg":"登录超时"}，
+    #      重扫码对配额耗尽完全无效。先按配额处理，超过观察窗口仍失败再走扫码。
+    if _cookie_structurally_complete(cookie):
+        now = time.time()
+        first = float(_read_2012_state().get("first_seen") or 0)
+        if not first:
+            _write_2012_state({"first_seen": now})
+            return {
+                "ok": False,
+                "refreshed": False,
+                "needs_scan": False,
+                "quota_suspected": True,
+                "message": (
+                    "微信读书返回 -2012（登录超时与配额耗尽同码）。Cookie 结构完整，"
+                    "按配额耗尽处理：不弹扫码，等配额重置。"
+                ),
+            }
+        waited_h = (now - first) / 3600
+        if now - first < ESCALATE_AFTER_S:
+            return {
+                "ok": False,
+                "refreshed": False,
+                "needs_scan": False,
+                "quota_suspected": True,
+                "waited_hours": round(waited_h, 1),
+                "message": (
+                    f"微信读书仍返回 -2012，配额观察窗口 {waited_h:.1f}h / "
+                    f"{ESCALATE_AFTER_S / 3600:.0f}h，未到升级扫码的时机。"
+                ),
+            }
+        # 超过窗口仍失败：配额不太可能连续耗尽这么久，按真失效走刷新 + 扫码
+        print("[agent] -2012 持续超过观察窗口，升级为登录失效处理")
 
     # 2) 需要刷新：无头优先（cooldown_hours=0 强制真刷新，绕过 6h 冷却误判）
     try:
@@ -108,6 +148,7 @@ def do_refresh() -> dict:
 
     if ok:
         _clear_alert_mark()
+        _clear_2012_state()
         return {
             "ok": True,
             "refreshed": True,
@@ -182,8 +223,39 @@ def _notify(title: str, body: str):
 
 
 def _clear_alert_mark():
+    for path in (ALERT_MARK, os.path.join(os.path.dirname(LIC_PATH), ".quota_alert_active")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _cookie_structurally_complete(cookie: str) -> bool:
+    """结构完整 = 至少带 wr_vid 与 wr_skey，能证明「曾经登录过」而不是空壳。"""
+    return bool(cookie) and "wr_vid=" in cookie and ("wr_" + "skey=") in cookie
+
+
+def _read_2012_state() -> dict:
     try:
-        os.remove(ALERT_MARK)
+        with open(STATE_2012, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_2012_state(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_2012), exist_ok=True)
+        with open(STATE_2012, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def _clear_2012_state() -> None:
+    try:
+        os.remove(STATE_2012)
     except OSError:
         pass
 
