@@ -504,7 +504,11 @@ class MpsWereadMP(MpsWeread):
             try:
                 item["content"] = self._get_mp_content(review_id)
             except WereadMPAPIError as exc:
-                logger.warning(f"微信读书正文获取失败 [{review_id}]: {exc}")
+                logger.warning(f"微信读书正文获取失败 [{review_id}]: {exc}，本篇不入库留待下次重试")
+                raise exc
+            if not (item.get("content") or "").strip():
+                logger.warning(f"微信读书正文为空 [{review_id}]，本篇不入库留待下次重试")
+                raise WereadMPAPIError("empty_content", f"article body is empty for {review_id}")
         if CallBack is not None:
             super().FillBack(
                 CallBack=CallBack,
