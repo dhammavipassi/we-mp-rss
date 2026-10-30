@@ -279,8 +279,15 @@ def _push_omnifocus_scan_needed():
             [push_bin,
              "--title", "需处理 · 微信读书 Cookie · 扫码登录",
              "--note",
+             "要点\n"
              "公众号管道正文抓取依赖 WeRead 登录态，当前 Cookie 已失效。\n"
-             "登录二维码已弹到默认浏览器，微信扫码+手机确认后管道自动恢复。",
+             "\n"
+             "步骤\n"
+             "1. 用微信扫描浏览器里弹出的二维码\n"
+             "2. 手机确认后管道自动恢复\n"
+             "\n"
+             "来源\n"
+             "host_weread_refresh_agent.py",
              "--project", "管道故障",
              "--flag", "--replace"],
             timeout=600, capture_output=True)
