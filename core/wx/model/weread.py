@@ -56,6 +56,14 @@ class MpsWeread(WxGather):
     # 采集器按源实例化，实例级标记无法跨源生效，故用类属性。
     _shelf_unavailable_reason: str = ""
 
+    # 进程级：被判定「额度/风控受限」的账号（vid → 解封时间戳），跨源实例共享。
+    # 为什么要有它：采集器按源实例化，每次 _load_weread_auth 都从 0 号开始，
+    # 一旦 0 号被限，25 个源就会各自先撞一次 -2012 才切到可用账号——既慢，
+    # 又在持续给一个已经被限的号加压。记 30 分钟，到期再回头试它。
+    _exhausted_accounts: dict = {}
+    _account_rotation: int = 0
+    _EXHAUSTED_TTL_S: int = 1800
+
     def __init__(self, is_add: bool = False):
         super().__init__(is_add=is_add)
         self._weread_cookies: str = ""
@@ -103,39 +111,72 @@ class MpsWeread(WxGather):
             else:
                 self._weread_accounts = []
 
-        # 选择当前激活账号：优先 env 变量覆盖，否则用第一个
-        self._current_account_idx = 0
-        self._weread_cookies = app_cfg.get("weread.cookie", "") or (
-            self._weread_accounts[0].get("cookie", "") if self._weread_accounts else ""
+        # 选择起始账号：跳过仍在限制期内的账号，并在可用账号间轮转摊量。
+        # 全部受限（或只有一个）时退回 0 号，行为与改动前一致。
+        self._current_account_idx = self._pick_start_account()
+        _acc = (
+            self._weread_accounts[self._current_account_idx]
+            if self._weread_accounts else {}
         )
-        self._weread_ticket = app_cfg.get("weread.ticket", "") or (
-            self._weread_accounts[0].get("ticket", "") if self._weread_accounts else ""
-        )
-        self._weread_vid = app_cfg.get("weread.vid", "") or (
-            self._weread_accounts[0].get("vid", "") if self._weread_accounts else ""
-        )
-        self._weread_name = (
-            self._weread_accounts[0].get("name", "") if self._weread_accounts else ""
-        )
+        self._weread_cookies = app_cfg.get("weread.cookie", "") or _acc.get("cookie", "")
+        self._weread_ticket = app_cfg.get("weread.ticket", "") or _acc.get("ticket", "")
+        self._weread_vid = app_cfg.get("weread.vid", "") or _acc.get("vid", "")
+        self._weread_name = _acc.get("name", "")
+
+    def _pick_start_account(self) -> int:
+        """挑本次请求的起始账号：优先未受限的，并在它们之间轮转摊量。
+
+        没有可用账号或只有一个账号时返回 0——与改动前行为一致，
+        单账号用户完全不受影响。
+        """
+        n = len(self._weread_accounts)
+        if n <= 1:
+            return 0
+        import time as _time
+
+        now = _time.time()
+        type(self)._account_rotation = (type(self)._account_rotation + 1) % n
+        for offset in range(n):
+            idx = (type(self)._account_rotation + offset) % n
+            vid = str(self._weread_accounts[idx].get("vid") or "")
+            if type(self)._exhausted_accounts.get(vid, 0) <= now:
+                return idx
+        return 0
+
+    def _mark_account_exhausted(self):
+        """把当前账号记为受限，后续请求在 TTL 内不再拿它开刀。"""
+        import time as _time
+
+        vid = str(self._weread_vid or "")
+        if not vid:
+            return
+        type(self)._exhausted_accounts[vid] = _time.time() + type(self)._EXHAUSTED_TTL_S
 
     def _switch_weread_account(self) -> bool:
-        """切换到下一个微信读书账号（round-robin）。
+        """切换到下一个可用（未受限）的微信读书账号。
 
         返回 ``True`` 表示成功切到了**不同**的账号；
-        ``False`` 表示只有一个账号或已切回原点。
+        ``False`` 表示只有一个账号或没有其它可用账号。
         """
-        if len(self._weread_accounts) <= 1:
+        n = len(self._weread_accounts)
+        if n <= 1:
             return False
-        prev_idx = self._current_account_idx
-        self._current_account_idx = (self._current_account_idx + 1) % len(
-            self._weread_accounts
-        )
-        acc = self._weread_accounts[self._current_account_idx]
-        self._weread_cookies = acc.get("cookie", "")
-        self._weread_ticket = acc.get("ticket", "")
-        self._weread_vid = acc.get("vid", "")
-        self._weread_name = acc.get("name", "")
-        return True
+        import time as _time
+
+        now = _time.time()
+        for step in range(1, n):
+            idx = (self._current_account_idx + step) % n
+            vid = str(self._weread_accounts[idx].get("vid") or "")
+            if type(self)._exhausted_accounts.get(vid, 0) > now:
+                continue
+            self._current_account_idx = idx
+            acc = self._weread_accounts[idx]
+            self._weread_cookies = acc.get("cookie", "")
+            self._weread_ticket = acc.get("ticket", "")
+            self._weread_vid = acc.get("vid", "")
+            self._weread_name = acc.get("name", "")
+            return True
+        return False
 
     def _weread_headers(self, include_ticket=False) -> dict:
         """构造微信读书 web 域请求头（当前生效账号的 Cookie）。
@@ -199,6 +240,9 @@ class MpsWeread(WxGather):
             if is_quota_exhausted:
                 if self._current_account_idx not in tried_accounts:
                     tried_accounts.add(self._current_account_idx)
+                # 记住这个号已受限：后面的源不必再拿它开刀，
+                # 也别继续给一个已被限的号加压。
+                self._mark_account_exhausted()
                 idx_before = self._current_account_idx
                 if self._switch_weread_account() and self._current_account_idx not in tried_accounts:
                     logger.info(
@@ -215,6 +259,9 @@ class MpsWeread(WxGather):
                 )
 
             self._weread_quota_exhausted = False
+            # 注意：这里**不**撤销 _exhausted_accounts 里的标记。
+            # /api/mp/cover 在正文被限时照样成功，按「这次请求成功」解除标记
+            # 会让每个源都把受限号再撞一遍。恢复只由 TTL 到期触发。
             return resp
 
     def _weread_get(self, url: str, params: dict = None) -> Optional[dict]:
