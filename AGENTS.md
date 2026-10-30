@@ -14,7 +14,7 @@ Backend test coverage is minimal and mostly lives near the code, for example `co
 
 ## Commit & Pull Request Guidelines
 Recent history includes `feat:` commits alongside ad-hoc messages like `1.4.9-Fix`; use Angular-style commits going forward, for example `fix: handle expired WeChat cookies`. Keep the body as `-` prefixed lines without blank lines. Create a fresh working branch before changes; for Codex-assisted work use `codex/YYYY-MM-DD`. PRs should include a short problem statement, the key changes, linked issues when relevant, config or migration notes, and screenshots for UI changes.
-This clone should keep `origin` pointed at your fork and `upstream` pointed at `https://github.com/rachelos/we-mp-rss`. Before pushing or opening a PR, fetch upstream and merge the latest `upstream/main` into your working branch if it has advanced.
+This clone: `fork` = `https://github.com/dhammavipassi/we-mp-rss`（我们的仓库，推送目标），`origin` = `https://github.com/rachelos/we-mp-rss`（上游只读参考）。当前分支已跟踪 `fork/<branch>`，日常直接 `git push` 即可。合并上游前先 `git fetch origin`，再把 `origin/main` 并入工作分支。
 
 ## Security & Configuration Tips
 Do not commit `config.yaml`, `/.env`, tokens, cookies, or data from `data/`. Start from `config.example.yaml` and `/.env.example`, then keep real secrets in local-only config. For deployment environments where WeChat blocks datacenter IPs, prefer the compose `singbox` sidecar and a single `PROXY_URL=` entry in `/.env` instead of modifying host proxy settings or duplicating proxy fields across files. Review `SECURITY.md` before changing auth, webhooks, or access-key flows.
